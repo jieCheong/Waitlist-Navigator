@@ -5,9 +5,12 @@ const enc = (text) => Buffer.from(text);
 
 async function columnsOf(client, table) {
   const { rows } = await client.query(
-    `SELECT column_name FROM information_schema.columns WHERE table_name = $1`,
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = $1`,
     [table],
   );
+  // A missing table has no columns, which would make every "column is absent" assertion pass.
+  assert.ok(rows.length > 0, `table ${table} does not exist`);
   return rows.map((row) => row.column_name);
 }
 
