@@ -1,0 +1,17 @@
+{
+  "name": "waitlist-navigator",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "format": "prettier --write ."
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
