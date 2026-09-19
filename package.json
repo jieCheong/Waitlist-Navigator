@@ -9,9 +9,15 @@
   "scripts": {
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "migrate:up": "npm run migrate:up -w @waitlist/api",
+    "migrate:down": "npm run migrate:down -w @waitlist/api",
+    "check:migrations": "node scripts/check-migrations.mjs"
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "pg": "^8.23.0"
   }
 }

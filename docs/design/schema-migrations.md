@@ -1,6 +1,6 @@
 # Schema and migrations design
 
-Phase 1. Status: design approved, migrations not yet written.
+Phase 1. Status: implemented and verified by npm run check:migrations.
 
 ## 1. Goals and non-goals
 
@@ -26,8 +26,10 @@ Phase 1. Status: design approved, migrations not yet written.
 |---|------|----------|
 | 1 | `core-tables` | roles, `zip_centroids`, `clinics`, `payers`, `users`, `refresh_tokens`, `clinicians`, `clinician_payers`, `availability_slots` |
 | 2 | `families-children-intake` | `families`, `children`, `intake_requests` |
-| 3 | `waitlist-offers-bookings` | `waitlist_entries`, `offers`, `bookings` |
-| 4 | `scoring-config-audit-log` | `scoring_config`, `audit_log`, the `REVOKE` |
+| 3 | `scoring-config-waitlist-offers-bookings` | `scoring_config`, `waitlist_entries`, `offers`, `bookings` |
+| 4 | `audit-log` | `audit_log`, the `REVOKE` |
+
+`scoring_config` is in migration 3 because `offers.scoring_config_id` references it, so it has to exist before `offers`.
 
 ## 3. Roles and privileges
 
@@ -53,7 +55,7 @@ Two roles. The migration runner connects as the owner role. The API connects as 
 
 ### Migration 1: core tables
 
-**`zip_centroids`**: `zip` (PK, `CHECK zip ~ '^\d{5}$'`), `lat`, `lng`. Schema only. Rows come from the seed script's zip loader, from a static file limited to the DFW zips in use (Census ZCTA gazetteer). Reference: `clinics.zip` and `families.zip` are foreign keys to it, so an unknown zip is rejected at write time.
+**`zip_centroids`**: `zip` (PK, `CHECK zip ~ '^\d{5}$'`), `lat`, `lng`. Schema only. Rows come from the seed script's zip loader, from a static file limited to the DFW zips in use (Census ZCTA gazetteer). Reference: `clinics.zip` and `families.zip` are foreign keys to it, so an unknown zip is rejected at write time. The API catches the `23503` on those two columns and returns a clear "we currently serve DFW zip codes" error instead of a raw constraint violation.
 
 **`clinics`**: `name`, `timezone`, `city`, `state`, `zip`.
 
@@ -103,7 +105,15 @@ Two roles. The migration runner connects as the owner role. The API connects as 
 - No urgency and no notes column.
 - Indexes: `family_id`, `status`.
 
-### Migration 3: waitlist, offers, bookings
+### Migration 3: scoring config, waitlist, offers, bookings
+
+**`scoring_config`**
+
+- Columns: `clinic_id NOT NULL`, `version`, `weights jsonb`, `is_active` (default false), `created_by` (nullable, since the seeded v1 row has no author).
+- `weights` is an object with two required groups, `fit` and `priority`, validated by a Zod schema in `@waitlist/shared`. The database only checks that it is an object, because the factor list will change in Phase 4. Example values: availability overlap is worth 40 points, and the re-offer boost is worth 10.
+- `UNIQUE (clinic_id, version)`, plus a partial unique index on (`clinic_id`) `WHERE is_active`.
+- Configs are append-only in practice: a change is a new version, and offers point at the version that scored them.
+- Every clinic gets a v1 row. Creating a clinic (API or seed) creates that row in the same transaction. `PUT /admin/scoring-config` takes a clinic.
 
 **`waitlist_entries`**
 
@@ -125,6 +135,7 @@ Two roles. The migration runner connects as the owner role. The API connects as 
 - `one_active_offer_per_slot`: `UNIQUE (slot_id, week_start) WHERE status IN ('proposed','accepted')`.
 - Partial unique on (`waitlist_entry_id`) `WHERE status = 'proposed'`, so one entry never holds two live offers.
 - Index on (`status`, `expires_at`) for the expiry sweep.
+- `UNIQUE (id, clinic_id, slot_id, week_start, waitlist_entry_id)`. It is trivially unique because `id` is the primary key, and exists only to be the target of the booking foreign key below.
 
 **`bookings`**
 
@@ -132,17 +143,10 @@ Two roles. The migration runner connects as the owner role. The API connects as 
 - `week_start date NOT NULL`, same Monday `CHECK`.
 - `UNIQUE (slot_id, week_start)`, unconditional.
 - `UNIQUE (waitlist_entry_id)`. See section 11 for what this means.
+- `FOREIGN KEY (offer_id, clinic_id, slot_id, week_start, waitlist_entry_id) REFERENCES offers (id, clinic_id, slot_id, week_start, waitlist_entry_id)`. A booking cannot disagree with its offer about slot, week, entry or clinic, even if the accept code has a bug. All five columns are `NOT NULL`, because a composite foreign key skips the check when any column is null. What the key cannot express is that the offer's status is `accepted`; the accept transaction checks that under the offer lock, with a test.
 - There is no status column. A cancellation deletes the row, writes an audit entry, and sets the offer to `withdrawn` in one transaction. A `cancelled` row would block the slot-week forever under an unconditional unique constraint, and the audit log keeps the history.
 
-### Migration 4: scoring config and audit log
-
-**`scoring_config`**
-
-- Columns: `clinic_id NOT NULL`, `version`, `weights jsonb`, `is_active`, `created_by`.
-- `weights` is an object with two required groups, `fit` and `priority`, validated by a Zod schema in `@waitlist/shared`. The database only checks that it is an object, because the factor list will change in Phase 4. Example values: availability overlap is worth 40 points, and the re-offer boost is worth 10.
-- `UNIQUE (clinic_id, version)`, plus a partial unique index on (`clinic_id`) `WHERE is_active`.
-- Configs are append-only in practice: a change is a new version, and offers point at the version that scored them.
-- Every clinic gets a v1 row. Creating a clinic (API or seed) creates that row in the same transaction. `PUT /admin/scoring-config` takes a clinic.
+### Migration 4: audit log
 
 **`audit_log`** (see section 6)
 
@@ -162,7 +166,7 @@ Two roles. The migration runner connects as the owner role. The API connects as 
 - **The unique constraints are the correctness guarantee.** Two concurrent offers for the same slot-week, or two bookings for the same slot-week, cannot both commit. The loser gets `23505`, which the API maps to "slot taken".
 - **`SELECT … FOR UPDATE` covers state transitions and the caseload check.** Accepting an offer locks the offer, then the clinician row (so the count of the clinician's bookings cannot change underneath), then the slot.
 - **Fixed lock order: offer, then clinician, then slot.** Every code path that takes more than one of these locks takes them in that order (a path that needs only some of them still follows it), so concurrent accepts cannot deadlock. The load test asserts zero `40P01` (deadlock detected) errors.
-- `clinic_id` is denormalised onto offers and bookings for scoping. That it matches the slot's clinic and the waitlist entry's clinic is checked inside the offer transaction (section 9).
+- `clinic_id` is denormalised onto offers and bookings for scoping. A booking's `clinic_id` is pinned to its offer's by the composite foreign key. That an offer's `clinic_id` matches its slot's clinic and its waitlist entry's clinic is checked inside the offer transaction (section 9).
 
 ## 8. PII handling
 
@@ -183,12 +187,12 @@ The database cannot see who is calling or compare across tables here, so each of
 - A coordinator's or clinician's `clinic_id` matches the clinic of the clinician they act on.
 - Only coordinators set `urgency_level`.
 - An offer's `clinic_id` matches its slot's clinic and its waitlist entry's clinic.
-- A booking's `slot_id`, `week_start` and `waitlist_entry_id` equal those of the offer it was created from. Bookings are only created inside the accept transaction, which copies the values from the locked offer.
+- A booking is only created from an offer whose status is `accepted`, checked in the accept transaction under the offer lock. (That the booking's slot, week, entry and clinic equal the offer's is a database constraint, not an API rule; see section 5.)
 - Caseload: a clinician's caseload is the count of bookings whose `week_start >= the current Monday` (in the clinic's timezone), reached through the slot join, and it may not exceed `caseload_cap`.
 
 ## 10. Verification
 
-`scripts/check-migrations.mjs` runs against a throwaway database on the compose Postgres and asserts:
+`scripts/check-migrations.mjs` runs against a throwaway database on the compose Postgres. Fixtures load `zip_centroids` first, because clinics and families reference it. The script asserts:
 
 1. `up`, `down`, `up` all succeed on a fresh database.
 2. As `app_user`, `UPDATE` and `DELETE` on `audit_log` fail with `42501`, and `INSERT` succeeds.
@@ -200,6 +204,9 @@ The database cannot see who is calling or compare across tables here, so each of
 8. Two `proposed` offers for one waitlist entry fail with `23505`.
 9. The `users` role / `clinic_id` check rejects a family user with a clinic and a coordinator without one.
 10. `pg_dump --schema-only` output after the second `up` is identical to the output after the first.
+11. A booking whose slot, week, entry or clinic disagrees with its offer fails with `23503`.
+12. An intake request pointing at another family's child fails with `23503`.
+13. A clinic or family with a zip not in `zip_centroids` fails with `23503`.
 
 Deploy note: the deployed demo database needs `zip_centroids` populated, so the deploy step runs the seed script's zip loader.
 
